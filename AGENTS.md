@@ -33,9 +33,11 @@ node dist-service/index.mjs
 - `src/main.ts`：独立服务入口，OneBot WS 连接与进程生命周期
 - `src/app.ts`：组装层，创建 Config/MsgDB/OpenCode/Sessions/MCP/Panel/Dream 等
 - `src/sessions.ts`：中枢。持久 session 映射、上下文组装、触发/批量窗口、发送队列、watchdog、工作区文件
+- `src/identity.ts`：跨会话身份库（QQ → 私聊足迹 + 群关系），持久化 `identity.json`
+- `src/group-context.ts`：为私聊工作区生成 `group-context/`（群索引 + 各群 MEMORY 快照）
 - `src/agentsmd.ts`：每个群/私聊工作区的 AGENTS.md 人格与规则生成器
 - `src/opencode.ts`：OpenCode V2 HTTP 客户端 + SSE 事件订阅
-- `src/mcp.ts`：19 个 MCP 工具（模型可见名带 `qqbot_` 前缀）
+- `src/mcp.ts`：22 个 MCP 工具（模型可见名带 `qqbot_` 前缀；含私聊跨群查询的 `list_my_groups` / `query_group_chat` / `get_group_memory`）
 - `src/executor.ts` / `tasks.ts`：远程 Docker 任务沙箱与任务注册表
 - `src/dream.ts`：梦境记忆调度
 - `src/panel.ts` / `panel.html`：控制面板后端/前端
@@ -53,9 +55,14 @@ node dist-service/index.mjs
 7. `AGENTS.md` 工作区文件由 `ensureWorkspaceFiles` 内容变化时重写；`opencode.json.instructions`（MEMORY.md）是 session 级快照，改 MEMORY.md 需要新 session 或 compact 后才生效。
 8. 任何配置/人格/模型改动都要考虑旧配置兼容；`adminQqs` 已迁移为 `ownerQqs`，不要重新引入旧叫法。
 
-## 私聊会话
+## 私聊会话与跨会话身份
 
 - scope 为 `private-<QQ>`，每个 QQ 一个独立 workspace / session。
+- `identity.ts` 记录「同一个 QQ 在哪些群里出现过」（群号、群名、群名片、角色、首次/最近活跃、消息数），持久化到 `data/identity.json`；只记关系不搬内容。
+- 私聊工作区会生成 `group-context/index.md` 与 `group-context/<群号>/MEMORY.md`（最近 20 个群的只读快照，不再有权时自动清理）。
+- 私聊人格额外注入「跨会话身份」段，列出可访问的群；MCP 侧 `list_my_groups` / `query_group_chat` / `get_group_memory` 只在私聊可用，并按 identity 校验群关系，非成员群直接拒绝。
+- 群会话只能查自己群：这些跨群工具在群 scope 下一律拒绝；沙箱任务模式也拒绝跨群查询。
+- 群记忆与私聊记忆仍然各自独立，跨会话只做索引与授权。
 - 私聊消息不走群聊批量窗口，到达即组装 prompt；上下文条数用 `contextMessageCount`，标题为 `[最近私聊内容]`。
 - 私聊人格由 `buildPrivateAgentsMd` 单独追加：每条都要回、不要 `[SILENT]`、不套用群聊 @/批量规则，并强调任务详情只对任务属主可见。
 - 私聊同样受 `ownerQqs` 管理命令权限、pending 清单、图片附件和串行发送队列约束。

@@ -175,11 +175,58 @@ ${TOOLS_DOC}
 `
 }
 
-export function buildPrivateAgentsMd(config: PluginConfig, qq: string, nickname: string, vision: VisionStrategy = 'bridge', stickers: StickerPromptItem[] = []): string {
+export interface PrivateGroupItem {
+  groupId: string
+  groupName: string
+  role: string
+  lastSeen: number
+}
+
+function roleLabel(role: string): string {
+  if (role === 'owner') return '群主'
+  if (role === 'admin') return '群管理员'
+  if (role === 'member') return '群成员'
+  return '未知'
+}
+
+function fmtDay(sec: number): string {
+  if (!sec) return '未知'
+  const d = new Date(sec * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+}
+
+function crossSessionSection(qq: string, groups: PrivateGroupItem[]): string {
+  const head =
+    '# 跨会话身份（同一 QQ，不同的会话）\n' +
+    '你以同一个 QQ（' + qq + '）身份出现在这个私聊和你待过的群里。' +
+    '私聊记忆（本工作区 MEMORY.md）只属于你和对方的私人对话；每个群的记忆在各自群工作区里维护，三者不会自动混在一起。\n'
+  if (groups.length === 0) {
+    return head + '你目前还没有可访问的群上下文（还没有在任何群里出现过）。不要假设自己了解任何群的情况。'
+  }
+  const list = groups
+    .map((g) => '- ' + (g.groupName || '(未命名群)') + '(' + g.groupId + ')，你的身份：' + roleLabel(g.role) + '，最近活跃：' + fmtDay(g.lastSeen))
+    .join('\n')
+  return (
+    head +
+    '\n# 你可以访问的群\n' +
+    list +
+    '\n\n查看方式（只读授权，不要绕开）：\n' +
+    '- 工作区 group-context/index.md：上面的索引；group-context/<群号>/MEMORY.md：该群记忆快照\n' +
+    '- qqbot_list_my_groups：列出你待过的群\n' +
+    '- qqbot_query_group_chat(group_id, ...)：查某个群的聊天记录（仅限上面列出的群）\n' +
+    '- qqbot_get_group_memory(group_id)：读某个群的长期记忆\n' +
+    '- 不在列表里的群一律没有权限；群会话也不能反过来查这个私聊的内容。'
+  )
+}
+
+export function buildPrivateAgentsMd(config: PluginConfig, qq: string, nickname: string, vision: VisionStrategy = 'bridge', stickers: StickerPromptItem[] = [], groups: PrivateGroupItem[] = []): string {
   return `${persona(config, stickers)}
 
 # 场景
 你正在和 ${nickname || '对方'}(QQ ${qq}) 私聊。私聊不需要@人。
+
+${crossSessionSection(qq, groups)}
 
 # 私聊规则
 - 每条私聊消息都要回应，不要输出 [SILENT]；不想展开就简短回一句。

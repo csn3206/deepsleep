@@ -11,6 +11,8 @@ import { TaskRec, TaskRegistry } from './tasks'
 import { MuteStore } from './mutes'
 import { StickerStore } from './stickers'
 import { ReminderStore } from './reminders'
+import { IdentityStore } from './identity'
+import { GroupContext } from './group-context'
 
 interface McpDeps {
   config: PluginConfig
@@ -20,6 +22,8 @@ interface McpDeps {
   mutes: MuteStore
   stickers: StickerStore
   reminders: ReminderStore
+  identity: IdentityStore
+  groupContext: GroupContext
   enqueueTask: (rec: TaskRec) => void
   log: (msg: string, ...args: unknown[]) => void
 }
@@ -142,8 +146,8 @@ export class QqMcpServer {
   }
 
   private buildServer(scope: string, taskMode: boolean): McpServer {
-    const { sessions, tasks, enqueueTask } = this.deps
-    const mcp = new McpServer({ name: 'qqbot', version: '0.1.3' })
+    const { sessions, tasks, enqueueTask, identity, groupContext } = this.deps
+    const mcp = new McpServer({ name: 'qqbot', version: '0.2.0' })
 
     mcp.registerTool(
       'send_message',
@@ -434,6 +438,69 @@ export class QqMcpServer {
       async ({ keyword, hours, limit }) => {
         if (!scope) return text('错误: 未知对话上下文')
         return text(this.searchChatLog(scope, keyword, hours ?? 24, Math.min(limit ?? 50, 200)))
+      }
+    )
+
+    // 跨会话：私聊里可以按授权查看自己在过的群的上下文（只读，且不能从群会话反过来查私聊）
+    const privateQqOf = (s: string): string | null => (s.startsWith('private-') ? s.slice(8) : null)
+
+    mcp.registerTool(
+      'list_my_groups',
+      {
+        description: '列出你这个 QQ 身份待过的群（只能在私聊里用）：群号、群名、你在群里的身份、最近活跃时间。',
+        inputSchema: {},
+      },
+      async () => {
+        const qq = privateQqOf(scope)
+        if (!qq) return text('错误: 这个工具只能在私聊里使用')
+        const groups = identity.groupsOf(qq)
+        if (groups.length === 0) return text('你还没有在任何群里出现过')
+        const lines = groups.map((g) => {
+          const role = g.role === 'owner' ? '群主' : g.role === 'admin' ? '群管理员' : g.role === 'member' ? '群成员' : '未知'
+          const name = g.group_name || '未命名群'
+          const seen = new Date(g.last_seen * 1000).toISOString().slice(0, 16).replace('T', ' ')
+          return name + '(' + g.group_id + ') 身份:' + role + ' 最近活跃:' + seen
+        })
+        return text(lines.join('\n'))
+      }
+    )
+
+    mcp.registerTool(
+      'query_group_chat',
+      {
+        description: '查某个你待过的群的聊天记录（只能在私聊里用；只能查自己在的群）',
+        inputSchema: {
+          group_id: z.string().describe('群号'),
+          keyword: z.string().optional().describe('关键词，模糊匹配；不传则查最近消息'),
+          hours: z.number().optional().describe('往前查多少小时，默认 24，最多 168'),
+          limit: z.number().optional().describe('最多返回多少条，默认 30，最多 50'),
+        },
+      },
+      async ({ group_id, keyword, hours, limit }) => {
+        const qq = privateQqOf(scope)
+        if (!qq) return text('错误: 这个工具只能在私聊里使用')
+        if (taskMode) return text('错误: 沙箱任务中不允许跨群查询')
+        if (!identity.isMember(qq, group_id)) return text('错误: 你不在群 ' + group_id + ' 里，不能查看该群记录')
+        const hoursSafe = Math.min(Math.max(Number(hours ?? 24) || 24, 1), 168)
+        const limitSafe = Math.min(Math.max(Number(limit ?? 30) || 30, 1), 50)
+        return text(this.searchChatLog('group-' + group_id, keyword, hoursSafe, limitSafe))
+      }
+    )
+
+    mcp.registerTool(
+      'get_group_memory',
+      {
+        description: '读取某个你待过的群的长期记忆 MEMORY.md（只能在私聊里用；只能读自己在的群）',
+        inputSchema: { group_id: z.string().describe('群号') },
+      },
+      async ({ group_id }) => {
+        const qq = privateQqOf(scope)
+        if (!qq) return text('错误: 这个工具只能在私聊里使用')
+        if (taskMode) return text('错误: 沙箱任务中不允许跨群查询')
+        if (!identity.isMember(qq, group_id)) return text('错误: 你不在群 ' + group_id + ' 里，不能查看该群记忆')
+        const memory = groupContext.readGroupMemory(group_id)
+        if (!memory) return text('这个群还没有整理过长期记忆（MEMORY.md 不存在）')
+        return text(memory.slice(0, 4000))
       }
     )
 

@@ -3,7 +3,9 @@ import path from 'node:path'
 import { PluginConfig, isOwnerQq } from './config'
 import { MsgDB, dayKey } from './msgdb'
 import { OpencodeClient, OpencodeEvent, OcPromptFile } from './opencode'
-import { buildGroupAgentsMd, buildPrivateAgentsMd, ALLOWED_FACE_IDS, VisionStrategy } from './agentsmd'
+import { buildGroupAgentsMd, buildPrivateAgentsMd, ALLOWED_FACE_IDS, PrivateGroupItem, VisionStrategy } from './agentsmd'
+import { IdentityStore } from './identity'
+import { GroupContext } from './group-context'
 import { cleanCqForDisplay, dedupeImages, extractAtTargets, extractImages, extractImagesFromRaw, extractReplyTo, extractText, MsgSegment, sanitizeOutgoingText, textToSegments, visibleMessageText } from './format'
 import { MuteStore } from './mutes'
 import { OB11MessageEvent, SessionRuntime } from './types'
@@ -115,6 +117,8 @@ export class SessionController {
   private voices: VoiceStore | null = null
   private judge: ProactiveJudge | null = null
   private stickers: StickerStore | null = null
+  private identity: IdentityStore | null = null
+  private groupContext: GroupContext | null = null
   // 主动参与：新消息计数 / 上次尝试 / 近一小时尝试时间戳
   private proactiveNewCount = new Map<string, number>()
   private proactiveLastAt = new Map<string, number>()
@@ -172,6 +176,15 @@ export class SessionController {
 
   attachStickers(store: StickerStore) {
     this.stickers = store
+  }
+
+  // 跨会话身份：同一个 QQ 在私聊与各群的关系索引（只记关系，不搬内容）
+  attachIdentity(store: IdentityStore) {
+    this.identity = store
+  }
+
+  attachGroupContext(ctx: GroupContext) {
+    this.groupContext = ctx
   }
 
   // 记录谁戳了机器人：之后一小段时间内该用户的消息直接交给模型判断
@@ -454,10 +467,27 @@ export class SessionController {
     const vision = await this.visionStrategy()
     // 内置小黄脸和收藏表情都注入：小黄脸用 CQ 码，收藏表情只走 qqbot_send_sticker
     const stickerList = (this.stickers?.listForAgent() ?? []).map((s) => ({ id: s.id, display: s.display }))
-    const agentsMd =
-      event.message_type === 'group'
-        ? buildGroupAgentsMd(this.config, String(event.group_id), event.group_name ?? '', vision, stickerList, this.botGroupRoleOf(scope))
-        : buildPrivateAgentsMd(this.config, String(event.user_id), event.sender?.nickname ?? '', vision, stickerList)
+    let agentsMd: string
+    if (event.message_type === 'group') {
+      agentsMd = buildGroupAgentsMd(this.config, String(event.group_id), event.group_name ?? '', vision, stickerList, this.botGroupRoleOf(scope))
+    } else {
+      // 私聊：把「这个 QQ 待过的群」同步进工作区 group-context/，并写进人格里的跨会话身份段
+      const privateQq = scope.startsWith('private-') ? scope.slice(8) : String(event.user_id ?? '')
+      let privateGroups: PrivateGroupItem[] = []
+      if (this.groupContext && privateQq) {
+        try {
+          privateGroups = this.groupContext.refresh(privateQq, directory).map((g) => ({
+            groupId: g.groupId,
+            groupName: g.groupName,
+            role: g.role,
+            lastSeen: g.lastSeen,
+          }))
+        } catch (e) {
+          this.log('刷新群上下文目录失败:', e)
+        }
+      }
+      agentsMd = buildPrivateAgentsMd(this.config, privateQq, event.sender?.nickname ?? '', vision, stickerList, privateGroups)
+    }
     // 只有主模型没有视觉能力时才注册 vision-bridge 子代理；多模态主模型直接读图
     const ocConfig: Record<string, unknown> = {
       $schema: 'https://opencode.ai/config.json',
@@ -684,6 +714,11 @@ export class SessionController {
 
   // 戳一戳：像一条普通消息一样入库并交给模型，模型自己决定回话/回拍/不理
   async handlePoke(scope: string, poker: number, nickname: string, selfId?: number): Promise<boolean> {
+    if (this.identity) {
+      const time = Math.floor(Date.now() / 1000)
+      if (scope.startsWith('group-')) this.identity.touchGroupMember({ groupId: scope.slice(6), qq: poker, nickname, time })
+      else this.identity.touchPrivate({ qq: poker, nickname, time })
+    }
     if (selfId) this.selfId = selfId
     const now = Date.now()
     const last = this.lastPokeTurnAt.get(scope) ?? 0
@@ -1054,6 +1089,27 @@ export class SessionController {
     return parts.join('\n')
   }
 
+  // 记录跨会话身份：群消息记群关系，私聊记用户足迹（只存关系与元数据）
+  private recordIdentity(scope: string, event: OB11MessageEvent) {
+    if (!this.identity) return
+    const userId = Number(event.user_id ?? 0)
+    if (!userId || (this.selfId && userId === this.selfId)) return
+    const time = event.time ?? Math.floor(Date.now() / 1000)
+    if (scope.startsWith('group-')) {
+      this.identity.touchGroupMember({
+        groupId: scope.slice(6),
+        groupName: event.group_name ?? '',
+        qq: userId,
+        nickname: event.sender?.nickname ?? '',
+        card: event.sender?.card ?? '',
+        role: event.sender?.role ?? '',
+        time,
+      })
+    } else {
+      this.identity.touchPrivate({ qq: userId, nickname: event.sender?.nickname ?? '', time })
+    }
+  }
+
   async handleMessage(event: OB11MessageEvent): Promise<void> {
     if (event.self_id) this.selfId = event.self_id
     if (event.user_id && event.self_id && event.user_id === event.self_id) return
@@ -1063,6 +1119,7 @@ export class SessionController {
     // 任何 scope 的第一次消息都建立上下文下界：旧消息不再被后续即时 prompt 分块重发
     if (!this.contextSince.has(scope)) this.contextSince.set(scope, Math.floor(Date.now() / 1000) - 2)
     if (event.user_id && this.mutes.isMuted(scope, String(event.user_id))) return
+    this.recordIdentity(scope, event)
     const raw = (event.raw_message ?? '').trim().replace(/\[CQ:[^\]]+\]/g, '').trim()
 
     if (raw === '/reset' || raw === '/abort') {

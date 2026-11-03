@@ -11,6 +11,8 @@ import { QqMcpServer } from './mcp'
 import { ControlPanel } from './panel'
 import { DreamMemory } from './dream'
 import { StickerStore } from './stickers'
+import { IdentityStore } from './identity'
+import { GroupContext } from './group-context'
 import { TtsClient } from './tts'
 import { VoiceStore } from './voices'
 import { ProactiveJudge } from './proactive'
@@ -38,6 +40,8 @@ export interface App {
   executor: TaskExecutor
   dream: DreamMemory
   stickers: StickerStore
+  identity: IdentityStore
+  groupContext: GroupContext
   mcp: QqMcpServer
   panel: ControlPanel
   dataPath: string
@@ -72,6 +76,11 @@ export async function createApp(options: AppOptions): Promise<App> {
       },
     },
   })
+  // 跨会话身份层：记录每个 QQ 在私聊/各群的关系，供私聊授权查询群上下文
+  const identity = new IdentityStore(options.dataPath, (m, ...x) => logger.warn(m, ...x))
+  const groupContext = new GroupContext(options.dataPath, identity, (m, ...x) => logger.warn(m, ...x))
+  sessions.attachIdentity(identity)
+  sessions.attachGroupContext(groupContext)
   const tasks = new TaskRegistry(options.dataPath)
   const executor = new TaskExecutor({
     config,
@@ -130,6 +139,8 @@ export async function createApp(options: AppOptions): Promise<App> {
     mutes: sessions.mutes,
     stickers,
     reminders,
+    identity,
+    groupContext,
     enqueueTask: (rec) => executor.enqueue(rec),
     log: (m, ...a) => logger.warn(m, ...a),
   })
@@ -237,6 +248,7 @@ export async function createApp(options: AppOptions): Promise<App> {
     dream.stop()
     panel.stop()
     mcp.stop()
+    identity.flush()
     db.close()
     log('已停止')
   }
@@ -253,6 +265,8 @@ export async function createApp(options: AppOptions): Promise<App> {
     stickers,
     mcp,
     panel,
+    identity,
+    groupContext,
     dataPath: options.dataPath,
     onMessage,
     stop,
